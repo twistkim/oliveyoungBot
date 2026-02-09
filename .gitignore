@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+.DS_Store
+*.csv
+state.json
+debug_html/
+daily_run.log
+ajdbot-d5f8c4f16102.json
+.claude/
