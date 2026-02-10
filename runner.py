@@ -1,5 +1,5 @@
 # runner.py
-"""Run keyword collection with safe, incremental saving.
+"""Run keyword collection with safe, incremental saving (Selenium version).
 
 What this does:
 - Reads already-split keyword files under DEFAULT_SPLIT_DIR (e.g., keywords_split/*.txt)
@@ -8,18 +8,15 @@ What this does:
 - Writes a checkpoint state.json so you can resume a finite "once" run
 
 Outputs:
-- pc_ads.csv (from https://ad.search.naver.com/search.naver?where=ad&query=...)
+- pc_ads.csv (from https://m.ad.search.naver.com/search.naver?where=ad&query=...)
 - m_products.csv (from https://m.search.naver.com/search.naver?where=m&query=...)
 
 Usage examples:
-- One pass through all keywords (recommended for 5,000+):
-  python runner.py --mode once --sleep 0.8
+- One pass through all keywords:
+  python runner.py --mode once
 
 - Infinite loop (keeps cycling):
-  python runner.py --mode loop --sleep 1.0
-
-- Use Playwright fallback (if HTML parsing often returns 0):
-  python runner.py --mode once --use_playwright
+  python runner.py --mode loop
 """
 
 from __future__ import annotations
@@ -35,8 +32,11 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Iterator
 from urllib.parse import quote
 
-import requests
 from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
 
 from keyword_manager import DEFAULT_SPLIT_DIR
 
@@ -70,8 +70,16 @@ M_FIELDS = [
 ]
 
 
+MOBILE_UAS = [
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/122.0.6261.89 Mobile/15E148 Safari/604.1",
+]
+
+
 def safe_slug(s: str, max_len: int = 80) -> str:
-    """Make a filesystem-safe slug."""
     s = re.sub(r"\s+", "_", s.strip())
     s = re.sub(r"[^0-9A-Za-z가-힣_\-]", "", s)
     return s[:max_len] if len(s) > max_len else s
@@ -86,70 +94,83 @@ def clean_text(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
-MOBILE_UAS = [
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
-    "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36",
-    "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/122.0.6261.89 Mobile/15E148 Safari/604.1",
-]
+# ---------------------------------------------------------------------------
+# Selenium browser management
+# ---------------------------------------------------------------------------
 
-DESKTOP_UAS = [
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
-]
+def create_browser(ua: str | None = None) -> webdriver.Chrome:
+    opts = Options()
+    opts.add_argument("--headless=new")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_argument("--lang=ko-KR")
+    opts.add_argument("--window-size=390,844")
+    if ua:
+        opts.add_argument(f"--user-agent={ua}")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
 
-
-def build_headers(mobile: bool = False) -> dict:
-    ua = random.choice(MOBILE_UAS if mobile else DESKTOP_UAS)
-    return {
-        "User-Agent": ua,
-        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-        "Accept-Encoding": "gzip, deflate",
-        "Connection": "keep-alive",
-        "Cache-Control": "max-age=0",
-        "Sec-Ch-Ua-Mobile": "?1" if mobile else "?0",
-        "Sec-Ch-Ua-Platform": '"Android"' if mobile else '"macOS"',
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-        "Upgrade-Insecure-Requests": "1",
-    }
+    service = Service(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=opts)
+    driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+        "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+    })
+    driver.set_page_load_timeout(20)
+    return driver
 
 
-def fetch_html_requests(url: str, mobile: bool, timeout: int = 15) -> tuple[str, str, int]:
-    r = requests.get(url, headers=build_headers(mobile=mobile), timeout=timeout, allow_redirects=True)
-    r.raise_for_status()
-    return r.text, r.url, r.status_code
+class BrowserPool:
+    """Reuse a single browser, restart every N requests to avoid memory leak."""
+
+    def __init__(self, restart_every: int = 50):
+        self.restart_every = restart_every
+        self._driver: webdriver.Chrome | None = None
+        self._count = 0
+
+    def _new_driver(self) -> webdriver.Chrome:
+        ua = random.choice(MOBILE_UAS)
+        return create_browser(ua=ua)
+
+    def get(self) -> webdriver.Chrome:
+        if self._driver is None or self._count >= self.restart_every:
+            self.quit()
+            self._driver = self._new_driver()
+            self._count = 0
+        return self._driver
+
+    def quit(self):
+        if self._driver:
+            try:
+                self._driver.quit()
+            except Exception:
+                pass
+            self._driver = None
+            self._count = 0
+
+    def tick(self):
+        self._count += 1
 
 
-async def fetch_html_playwright(url: str, mobile: bool, timeout_ms: int = 20000) -> str:
-    """Optional fallback when requests HTML is incomplete due to JS rendering."""
-    from playwright.async_api import async_playwright
+_pool = BrowserPool(restart_every=50)
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(
-            user_agent=build_headers(mobile=mobile)["User-Agent"],
-            locale="ko-KR",
-            viewport={"width": 390, "height": 844} if mobile else {"width": 1280, "height": 720},
-        )
-        page = await context.new_page()
-        await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-        await page.wait_for_timeout(800)
-        html = await page.content()
-        await context.close()
-        await browser.close()
-        return html
 
+def fetch_html_selenium(url: str, wait_sec: float = 1.5) -> str:
+    driver = _pool.get()
+    driver.get(url)
+    time.sleep(wait_sec)
+    html = driver.page_source
+    _pool.tick()
+    return html
+
+
+# ---------------------------------------------------------------------------
+# Parsing (unchanged)
+# ---------------------------------------------------------------------------
 
 def looks_blocked(html: str) -> bool:
     h = html.lower()
-    # Common signals for bot-block, consent, or unexpected pages
     signals = [
         "captcha",
         "자동입력",
@@ -158,9 +179,6 @@ def looks_blocked(html: str) -> bool:
         "일시적으로 차단",
         "robots",
         "unusual traffic",
-        "동의",
-        "consent",
-        "redirect",
     ]
     return any(sig.lower() in h for sig in signals)
 
@@ -218,7 +236,6 @@ def parse_mobile_products(html: str, keyword: str, category: str, source_url: st
     soup = BeautifulSoup(html, "lxml")
     rows: List[dict] = []
 
-    # 1차: 샘플 클래스 기반
     items = soup.select("li.ds9RptR1")
     rank = 0
 
@@ -252,7 +269,7 @@ def parse_mobile_products(html: str, keyword: str, category: str, source_url: st
         if max_items and rank >= max_items:
             break
 
-    # 2차 fallback: 위 결과가 아예 없을 때 느슨하게 추출
+    # fallback
     if not rows:
         candidates = soup.select("li strong span, li strong")
         for el in candidates:
@@ -278,8 +295,11 @@ def parse_mobile_products(html: str, keyword: str, category: str, source_url: st
     return rows
 
 
+# ---------------------------------------------------------------------------
+# CSV / State helpers (unchanged)
+# ---------------------------------------------------------------------------
+
 def append_rows(csv_path: Path, fieldnames: List[str], rows: List[dict]) -> None:
-    """Append rows to CSV; writes header if file doesn't exist."""
     if not rows:
         return
 
@@ -310,15 +330,6 @@ def load_keywords_file(fp: Path) -> List[str]:
 
 
 def build_round_robin_once(split_dir: Path, state: dict | None) -> Tuple[List[Tuple[str, List[str]]], List[int]]:
-    """Prepare (category -> keyword list) and positions for a finite one-pass run.
-
-    state format for positions:
-      {
-        "positions": {"skincare": 120, "makeup": 55, ...}
-      }
-
-    positions are next index to process for each category.
-    """
     files = sorted(split_dir.glob("*.txt"))
     buckets: List[Tuple[str, List[str]]] = []
 
@@ -335,7 +346,6 @@ def build_round_robin_once(split_dir: Path, state: dict | None) -> Tuple[List[Tu
     positions: List[int] = []
     for category, kws in buckets:
         p = int(pos_map.get(category, 0))
-        # clamp
         if p < 0:
             p = 0
         if p > len(kws):
@@ -346,10 +356,6 @@ def build_round_robin_once(split_dir: Path, state: dict | None) -> Tuple[List[Tu
 
 
 def iter_round_robin_once(buckets: List[Tuple[str, List[str]]], positions: List[int]) -> Iterator[Tuple[str, str, int]]:
-    """Yield each remaining keyword exactly once, in round-robin order.
-
-    Yields: (category, keyword, index_in_category)
-    """
     n = len(buckets)
     remaining = True
     idx = 0
@@ -382,6 +388,10 @@ def save_state(state_path: Path, state: dict) -> None:
     state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+# ---------------------------------------------------------------------------
+# Main process_keyword (Selenium version)
+# ---------------------------------------------------------------------------
+
 def process_keyword(
     keyword: str,
     category: str,
@@ -389,96 +399,54 @@ def process_keyword(
     out_m: Path,
     max_pc: int,
     max_m: int,
-    use_playwright: bool,
-    timeout: int,
     debug: bool,
     debug_dump: bool,
     debug_dump_dir: Path,
     debug_dump_budget: int,
     debug_dumps_done_ref: dict,
 ) -> Tuple[int, int]:
-    """Collect both PC ads and mobile products for a single keyword.
-
-    Returns: (pc_rows_count, mobile_rows_count)
-    """
     q = quote(keyword)
     pc_url = PC_AD_URL.format(q=q)
     m_url = MOBILE_URL.format(q=q)
 
     pc_rows: List[dict] = []
     m_rows: List[dict] = []
+    pc_html = ""
+    m_html = ""
 
-    # PC first
+    # PC ads
     try:
-        pc_html, pc_final_url, pc_status = fetch_html_requests(pc_url, mobile=True, timeout=timeout)
+        pc_html = fetch_html_selenium(pc_url, wait_sec=1.5)
         pc_rows = parse_pc_ads(pc_html, keyword, category, pc_url, max_items=max_pc)
     except Exception:
         pc_rows = []
-        pc_html = ""
-        pc_final_url = pc_url
-        pc_status = "-"
 
-    # Mobile second
+    # Mobile products
     try:
-        m_html, m_final_url, m_status = fetch_html_requests(m_url, mobile=True, timeout=timeout)
+        m_html = fetch_html_selenium(m_url, wait_sec=1.5)
         m_rows = parse_mobile_products(m_html, keyword, category, m_url, max_items=max_m)
     except Exception:
         m_rows = []
-        m_html = ""
-        m_final_url = m_url
-        m_status = "-"
-
-    # Optional Playwright fallback if either returned 0
-    if use_playwright and (not pc_rows or not m_rows):
-        import asyncio
-
-        if not pc_rows:
-            try:
-                pc_html = asyncio.run(fetch_html_playwright(pc_url, mobile=True))
-                pc_rows = parse_pc_ads(pc_html, keyword, category, pc_url, max_items=max_pc)
-            except Exception:
-                pc_rows = []
-
-        if not m_rows:
-            try:
-                m_html = asyncio.run(fetch_html_playwright(m_url, mobile=True))
-                m_rows = parse_mobile_products(m_html, keyword, category, m_url, max_items=max_m)
-            except Exception:
-                m_rows = []
 
     if debug and (len(pc_rows) == 0 and len(m_rows) == 0):
-        # Print small diagnostics
-        try:
-            pc_len = len(pc_html) if 'pc_html' in locals() and pc_html else 0
-        except Exception:
-            pc_len = 0
-        try:
-            m_len = len(m_html) if 'm_html' in locals() and m_html else 0
-        except Exception:
-            m_len = 0
-
-        pc_info = f"pc_final={locals().get('pc_final_url', pc_url)} status={locals().get('pc_status', '-') } len={pc_len} blocked={looks_blocked(locals().get('pc_html','') or '')}"
-        m_info = f"m_final={locals().get('m_final_url', m_url)} status={locals().get('m_status', '-') } len={m_len} blocked={looks_blocked(locals().get('m_html','') or '')}"
-        print(f"  [DEBUG] {pc_info}")
-        print(f"  [DEBUG] {m_info}")
+        pc_len = len(pc_html) if pc_html else 0
+        m_len = len(m_html) if m_html else 0
+        print(f"  [DEBUG] pc_len={pc_len} blocked={looks_blocked(pc_html or '')}")
+        print(f"  [DEBUG] m_len={m_len} blocked={looks_blocked(m_html or '')}")
 
     if debug_dump and (len(pc_rows) == 0 and len(m_rows) == 0):
-        # Dump a few samples to inspect HTML when selectors fail or blocked.
         done = int(debug_dumps_done_ref.get('done', 0))
         if done < debug_dump_budget:
             debug_dump_dir.mkdir(parents=True, exist_ok=True)
             slug = f"{safe_slug(category)}__{safe_slug(keyword)}"
-            pc_path = debug_dump_dir / f"pc__{slug}.html"
-            m_path = debug_dump_dir / f"m__{slug}.html"
             try:
-                pc_path.write_text(locals().get('pc_html','') or '', encoding='utf-8')
-                m_path.write_text(locals().get('m_html','') or '', encoding='utf-8')
+                (debug_dump_dir / f"pc__{slug}.html").write_text(pc_html or '', encoding='utf-8')
+                (debug_dump_dir / f"m__{slug}.html").write_text(m_html or '', encoding='utf-8')
                 debug_dumps_done_ref['done'] = done + 1
-                print(f"  [DUMP] saved HTML -> {pc_path} , {m_path}")
+                print(f"  [DUMP] saved HTML -> debug_html/pc__{slug}.html")
             except Exception as e:
                 print(f"  [DUMP][ERROR] {e}")
 
-    # ✅ Incremental save (append) so progress is not lost
     append_rows(out_pc, PC_FIELDS, pc_rows)
     append_rows(out_m, M_FIELDS, m_rows)
 
@@ -495,8 +463,6 @@ def main():
     ap.add_argument("--out_m", default="m_products.csv", help="Mobile output CSV")
     ap.add_argument("--max_pc", type=int, default=5, help="Max PC ads rows per keyword")
     ap.add_argument("--max_m", type=int, default=5, help="Max mobile product rows per keyword")
-    ap.add_argument("--timeout", type=int, default=15, help="HTTP timeout seconds")
-    ap.add_argument("--use_playwright", action="store_true", help="Use Playwright fallback when parsing returns 0")
     ap.add_argument("--state", default="state.json", help="Checkpoint state file")
     ap.add_argument("--debug", action="store_true", help="Print extra debug info when PC/M results are 0")
     ap.add_argument("--debug_dump", action="store_true", help="Dump HTML to debug_html/ when PC/M results are 0")
@@ -511,117 +477,111 @@ def main():
     state = load_state(state_path) or {}
     debug_ref = {"done": 0}
 
-    if args.mode == "once":
-        buckets, positions = build_round_robin_once(split_dir, state)
+    try:
+        if args.mode == "once":
+            buckets, positions = build_round_robin_once(split_dir, state)
 
-        total_pc = 0
-        total_m = 0
-        total_done = 0
+            total_pc = 0
+            total_m = 0
+            total_done = 0
 
-        for category, keyword, index_in_category in iter_round_robin_once(buckets, positions):
-            try:
-                pc_n, m_n = process_keyword(
-                    keyword=keyword,
-                    category=category,
-                    out_pc=out_pc,
-                    out_m=out_m,
-                    max_pc=args.max_pc,
-                    max_m=args.max_m,
-                    use_playwright=args.use_playwright,
-                    timeout=args.timeout,
-                    debug=args.debug,
-                    debug_dump=args.debug_dump,
-                    debug_dump_dir=Path("debug_html"),
-                    debug_dump_budget=args.debug_limit,
-                    debug_dumps_done_ref=debug_ref,
-                )
-                total_pc += pc_n
-                total_m += m_n
+            for category, keyword, index_in_category in iter_round_robin_once(buckets, positions):
+                try:
+                    pc_n, m_n = process_keyword(
+                        keyword=keyword,
+                        category=category,
+                        out_pc=out_pc,
+                        out_m=out_m,
+                        max_pc=args.max_pc,
+                        max_m=args.max_m,
+                        debug=args.debug,
+                        debug_dump=args.debug_dump,
+                        debug_dump_dir=Path("debug_html"),
+                        debug_dump_budget=args.debug_limit,
+                        debug_dumps_done_ref=debug_ref,
+                    )
+                    total_pc += pc_n
+                    total_m += m_n
 
-                # progress log
-                print(f"[{category}] {keyword}  -> PC:{pc_n} / M:{m_n}")
+                    print(f"[{category}] {keyword}  -> PC:{pc_n} / M:{m_n}")
 
-                # ✅ checkpoint per keyword
-                pos_map = state.get("positions", {})
-                pos_map[category] = index_in_category + 1
-                state["positions"] = pos_map
-                state["last"] = {"category": category, "keyword": keyword}
-                save_state(state_path, state)
+                    pos_map = state.get("positions", {})
+                    pos_map[category] = index_in_category + 1
+                    state["positions"] = pos_map
+                    state["last"] = {"category": category, "keyword": keyword}
+                    save_state(state_path, state)
 
-            except KeyboardInterrupt:
-                print("\n⏹️ Stopped by user (Ctrl+C). State saved.")
-                save_state(state_path, state)
-                break
-            except Exception as e:
-                # Save error to state and continue
-                state["last_error"] = {"category": category, "keyword": keyword, "error": str(e)}
-                save_state(state_path, state)
-                print(f"[ERROR] [{category}] {keyword} -> {e}")
+                except KeyboardInterrupt:
+                    print("\n Stopped by user (Ctrl+C). State saved.")
+                    save_state(state_path, state)
+                    break
+                except Exception as e:
+                    state["last_error"] = {"category": category, "keyword": keyword, "error": str(e)}
+                    save_state(state_path, state)
+                    print(f"[ERROR] [{category}] {keyword} -> {e}")
 
-            total_done += 1
-            time.sleep(max(0.0, args.sleep + random.uniform(0, args.jitter)))
+                total_done += 1
+                time.sleep(max(0.0, args.sleep + random.uniform(0, args.jitter)))
 
-        print(f"\n✅ DONE (once). keywords={total_done}, pc_rows={total_pc}, m_rows={total_m}")
+            print(f"\n DONE (once). keywords={total_done}, pc_rows={total_pc}, m_rows={total_m}")
 
-    else:
-        # loop forever: cycle through split files continually
-        # This does not try to resume exact position; it just keeps running.
-        # We still checkpoint the last processed keyword.
-        files = sorted(split_dir.glob("*.txt"))
-        if not files:
-            raise RuntimeError(f"No keyword files found in {split_dir}.")
+        else:
+            files = sorted(split_dir.glob("*.txt"))
+            if not files:
+                raise RuntimeError(f"No keyword files found in {split_dir}.")
 
-        buckets: List[Tuple[str, List[str]]] = []
-        for fp in files:
-            category = fp.stem
-            kws = load_keywords_file(fp)
-            if kws:
-                buckets.append((category, kws))
+            buckets: List[Tuple[str, List[str]]] = []
+            for fp in files:
+                category = fp.stem
+                kws = load_keywords_file(fp)
+                if kws:
+                    buckets.append((category, kws))
 
-        if not buckets:
-            raise RuntimeError(f"All keyword files in {split_dir} are empty.")
+            if not buckets:
+                raise RuntimeError(f"All keyword files in {split_dir} are empty.")
 
-        pos = [0] * len(buckets)
-        idx = 0
+            pos = [0] * len(buckets)
+            idx = 0
 
-        while True:
-            category, kws = buckets[idx]
-            keyword = kws[pos[idx]]
-            pos[idx] = (pos[idx] + 1) % len(kws)
-            idx = (idx + 1) % len(buckets)
+            while True:
+                category, kws = buckets[idx]
+                keyword = kws[pos[idx]]
+                pos[idx] = (pos[idx] + 1) % len(kws)
+                idx = (idx + 1) % len(buckets)
 
-            try:
-                pc_n, m_n = process_keyword(
-                    keyword=keyword,
-                    category=category,
-                    out_pc=out_pc,
-                    out_m=out_m,
-                    max_pc=args.max_pc,
-                    max_m=args.max_m,
-                    use_playwright=args.use_playwright,
-                    timeout=args.timeout,
-                    debug=args.debug,
-                    debug_dump=args.debug_dump,
-                    debug_dump_dir=Path("debug_html"),
-                    debug_dump_budget=args.debug_limit,
-                    debug_dumps_done_ref=debug_ref,
-                )
+                try:
+                    pc_n, m_n = process_keyword(
+                        keyword=keyword,
+                        category=category,
+                        out_pc=out_pc,
+                        out_m=out_m,
+                        max_pc=args.max_pc,
+                        max_m=args.max_m,
+                        debug=args.debug,
+                        debug_dump=args.debug_dump,
+                        debug_dump_dir=Path("debug_html"),
+                        debug_dump_budget=args.debug_limit,
+                        debug_dumps_done_ref=debug_ref,
+                    )
 
-                print(f"[{category}] {keyword}  -> PC:{pc_n} / M:{m_n}")
+                    print(f"[{category}] {keyword}  -> PC:{pc_n} / M:{m_n}")
 
-                state["last"] = {"category": category, "keyword": keyword}
-                save_state(state_path, state)
+                    state["last"] = {"category": category, "keyword": keyword}
+                    save_state(state_path, state)
 
-            except KeyboardInterrupt:
-                print("\n⏹️ Stopped by user (Ctrl+C). State saved.")
-                save_state(state_path, state)
-                break
-            except Exception as e:
-                state["last_error"] = {"category": category, "keyword": keyword, "error": str(e)}
-                save_state(state_path, state)
-                print(f"[ERROR] [{category}] {keyword} -> {e}")
+                except KeyboardInterrupt:
+                    print("\n Stopped by user (Ctrl+C). State saved.")
+                    save_state(state_path, state)
+                    break
+                except Exception as e:
+                    state["last_error"] = {"category": category, "keyword": keyword, "error": str(e)}
+                    save_state(state_path, state)
+                    print(f"[ERROR] [{category}] {keyword} -> {e}")
 
-            time.sleep(max(0.0, args.sleep + random.uniform(0, args.jitter)))
+                time.sleep(max(0.0, args.sleep + random.uniform(0, args.jitter)))
+
+    finally:
+        _pool.quit()
 
 
 if __name__ == "__main__":
