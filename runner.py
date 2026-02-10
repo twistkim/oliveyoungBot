@@ -86,23 +86,38 @@ def clean_text(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
+MOBILE_UAS = [
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/122.0.6261.89 Mobile/15E148 Safari/604.1",
+]
+
+DESKTOP_UAS = [
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
+]
+
+
 def build_headers(mobile: bool = False) -> dict:
-    if mobile:
-        ua = (
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
-        )
-    else:
-        ua = (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/121.0.0.0 Safari/537.36"
-        )
+    ua = random.choice(MOBILE_UAS if mobile else DESKTOP_UAS)
     return {
         "User-Agent": ua,
-        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.7,en;q=0.6",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Encoding": "gzip, deflate",
         "Connection": "keep-alive",
+        "Cache-Control": "max-age=0",
+        "Sec-Ch-Ua-Mobile": "?1" if mobile else "?0",
+        "Sec-Ch-Ua-Platform": '"Android"' if mobile else '"macOS"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
     }
 
 
@@ -474,8 +489,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--split_dir", default=str(DEFAULT_SPLIT_DIR), help="Directory containing split keyword txt files")
     ap.add_argument("--mode", choices=["once", "loop"], default="once", help="Run once through all keywords or loop forever")
-    ap.add_argument("--sleep", type=float, default=0.8, help="Base sleep seconds between keywords")
-    ap.add_argument("--jitter", type=float, default=0.4, help="Random jitter added to sleep (0~jitter)")
+    ap.add_argument("--sleep", type=float, default=2.0, help="Base sleep seconds between keywords")
+    ap.add_argument("--jitter", type=float, default=3.0, help="Random jitter added to sleep (0~jitter)")
     ap.add_argument("--out_pc", default="pc_ads.csv", help="PC output CSV")
     ap.add_argument("--out_m", default="m_products.csv", help="Mobile output CSV")
     ap.add_argument("--max_pc", type=int, default=5, help="Max PC ads rows per keyword")
